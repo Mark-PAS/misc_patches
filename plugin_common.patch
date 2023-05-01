@@ -1,0 +1,10 @@
+--- plugin_common.h	2012-11-08 19:06:54.000000000 +1030
++++ plugin_common.h	2023-05-02 00:40:49.020577154 +0930
+@@ -62,6 +62,7 @@
+ #include <sasl.h>
+ #include <saslutil.h>
+ #include <saslplug.h>
++typedef int (*sasl_callback_ft)(void);
+ 
+ #ifdef WIN32
+ #define PLUG_API __declspec(dllexport)

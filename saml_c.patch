@@ -1,0 +1,20 @@
+--- saml.c	2012-11-08 19:06:54.000000000 +1030
++++ saml.c	2023-05-02 00:42:05.817987218 +0930
+@@ -153,9 +153,15 @@
+ 	struct tm tm;
+ 	const char *format = "%Y-%m-%dT%TZ";
+ 
+-	if (strptime(date, format, &tm) == NULL)
+-		return (time_t)-1;
++        char *date2 = strdup(date);
++        if (strchr(date2,'.') != NULL && strchr(date2,'Z') != NULL)
++               strcpy(strchr(date2,'.'), strchr(date2,'Z'));
+ 
++        if (strptime(date2, format, &tm) == NULL){
++                free(date2);
++                return (time_t)-1;
++        }
++        free(date2);
+ 	return (timegm(&tm));
+ }
+ 
