@@ -1,0 +1,711 @@
+--- lasso/id-ff/provider.h
++++ lasso/id-ff/provider.h
+@@ -215,6 +215,9 @@
+ 		const char *service_id);
+ LASSO_EXPORT gchar* lasso_provider_get_metadata_one(LassoProvider *provider, const char *name);
+ LASSO_EXPORT GList* lasso_provider_get_metadata_list(LassoProvider *provider, const char *name);
++LASSO_EXPORT int lasso_provider_verify_saml_signature(LassoProvider *provider,
++                                                      xmlNode *signed_node,
++                                                      xmlDoc *doc);
+ 
+ LASSO_EXPORT LassoProvider* lasso_provider_new_from_dump(const gchar *dump);
+ 
+--- bindings/utils.c
++++ bindings/utils.c
+@@ -51,3 +51,26 @@
+ 	lasso_release_xml_node_list(list);
+ 	return node;
+ }
++
++/**
++ * lasso_string_fragment_to_xmldoc:
++ * @fragment: a fragment of an XML document
++ * @size: 
++ *
++ * Try to get one and only one node from a string, the node can be a simple string or a single node.
++ *
++ * Return value: a newly allocated xmlNode* or NULL if parsing fails.
++ */
++static xmlDoc*
++lasso_string_fragment_to_xmldoc(const char *fragment, int size) {
++	xmlDoc *doc = NULL;
++
++	if (size == 0) {
++		size = strlen(fragment);
++	}
++
++	/* single node case, with preceding or following spaces */
++	doc = xmlReadMemory(fragment, size, NULL, NULL, XML_PARSE_NONET);
++
++	return doc;
++}
+--- bindings/utils.py
++++ bindings/utils.py
+@@ -233,6 +233,10 @@
+     arg = unconstify(arg_type(arg))
+     return arg and arg.startswith('xmlNode')
+ 
++def is_xml_doc(arg):
++    arg = unconstify(arg_type(arg))
++    return arg and arg.startswith('xmlDoc')
++
+ def is_boolean(arg):
+     return arg_type(arg) in ('gboolean','bool')
+ 
+--- bindings/perl/typemap-out
++++ bindings/perl/typemap-out
+@@ -9,6 +9,9 @@
+ T_XMLNODE
+     $arg = xmlnode_to_pv($var, FALSE);
+ 
++T_XMLDOC
++    $arg = xmldoc_to_pv($var, FALSE);
++
+ T_GLIST_STRING
+     {
+       I32 ix, length;
+--- bindings/perl/glist_handling.c
++++ bindings/perl/glist_handling.c
+@@ -81,6 +81,48 @@
+ }
+ 
+ /**
++ * xmldoc_to_pv:
++ * @doc: an xmlDoc* object
++ * @do_free: do we need to free the doc after the conversion
++ *
++ * Return value: a newly allocated SV/PV or under.
++ */
++static SV*
++xmldoc_to_pv(xmlDoc *doc, gboolean do_free)
++{
++        xmlChar *xmlString;
++        int size;
++	SV *pestring = NULL;
++
++	if (doc == NULL) {
++		return &PL_sv_undef;
++	}
++
++        xmlDocDumpMemory(doc, &xmlString, &size);
++        pestring = newSVpv((char*)xmlString, size);
++	if (do_free) {
++		lasso_release_xml_doc(doc);
++	}
++        xmlFree(xmlString);
++
++	return pestring;
++}
++
++static xmlDoc *
++pv_to_xmldoc(SV *value) {
++	unsigned int size;
++	char *string;
++
++	if (! SvPOK(value))
++		return NULL;
++	string = SvPV(value, size);
++	if (! string)
++		return NULL;
++
++	return lasso_string_fragment_to_xmldoc(string, size);
++}
++
++/**
+  * array_to_glist_string:
+  * @array: a Perl array
+  *
+--- bindings/perl/typemap-in
++++ bindings/perl/typemap-in
+@@ -11,6 +11,9 @@
+ T_XMLNODE
+     $var = pv_to_xmlnode($arg);
+ 
++T_XMLDOC
++    $var = pv_to_xmldoc($arg);
++
+ T_GLIST_STRING
+     $var = array_to_glist_string((AV*)SvRV($arg));
+ 
+--- bindings/perl/lang.py
++++ bindings/perl/lang.py
+@@ -101,6 +101,8 @@
+ const LassoProvider *\tT_GOBJECT_WRAPPER
+ xmlNode*\tT_XMLNODE
+ const xmlNode*\tT_XMLNODE
++xmlDoc*\tT_XMLDOC
++const xmlDoc*\tT_XMLDOC
+ GList_string\tT_GLIST_STRING
+ GList_xmlnode\tT_GLIST_XMLNODE
+ GList_gobject\tT_GLIST_GOBJECT
+@@ -310,7 +312,7 @@
+                     if arg_default(arg):
+                         arg_names.append(aname + ' = ' + self.default_value(arg))
+                     else:
+-                        if is_cstring(arg) or is_glist(arg) or is_xml_node(arg) or is_object(arg):
++                        if is_cstring(arg) or is_glist(arg) or is_xml_node(arg) or is_xml_doc(arg) or is_object(arg):
+                             arg_names.append(aname + ' = NULL')
+                         else:
+                             raise Exception('Do not know what to do for optional: %s' % arg)
+@@ -321,7 +323,9 @@
+             if is_glist(arg) and not is_transfer_full(arg):
+                     cleanup.append(self.release_list(arg_name(arg), arg))
+             if is_xml_node(arg) and not is_transfer_full(arg):
+-                    cleanup.append('lasso_release_xml_node(%s)' % arg_name(arg))
++                    cleanup.append('lasso_release_xml_node(%s);' % arg_name(arg))
++            if is_xml_doc(arg) and not is_transfer_full(arg):
++                    cleanup.append('lasso_release_xml_doc(%s);' % arg_name(arg))
+             if is_hashtable(arg):
+                 raise Exception("No cleanup code generation for GHashTable")
+         self.xs.p(','.join(arg_names))
+@@ -478,7 +482,7 @@
+             return str + '*'
+ 
+     def glist_type(self, member):
+-        x = self.element_type_lookup(member, { 'string': 'GList_string', 'xml_node': 'GList_xmlnode', 'gobject': 'GList_gobject'})
++        x = self.element_type_lookup(member, { 'string': 'GList_string', 'xml_node': 'GList_xmlnode', 'xml_doc': 'GList_xmldoc', 'gobject': 'GList_gobject'})
+         if is_const(member):
+             return x + '_const'
+         return x
+@@ -491,6 +495,8 @@
+             return lookup_table['string']
+         elif is_xml_node(type):
+             return lookup_table['xml_node']
++        elif is_xml_doc(type):
++            return lookup_table['xml_doc']
+         elif is_object(type):
+             return lookup_table['gobject']
+         else:
+@@ -506,6 +512,8 @@
+             macro = 'lasso_release_list_of_strings'
+         elif is_xml_node(type):
+             macro = 'lasso_release_list_of_xml_node'
++        elif is_xml_doc(type):
++            macro = 'lasso_release_list_of_xml_doc'
+         elif is_object(type):
+             macro = 'lasso_release_list_of_gobjects'
+         else:
+@@ -520,6 +528,8 @@
+             macro = 'SvPV_nolen'
+         elif is_xml_node(type):
+             macro = 'pv_to_xmlnode'
++        elif is_xml_doc(type):
++            macro = 'pv_to_xmldoc'
+         elif is_object(type):
+             macro = 'gperl_get_object'
+         else:
+@@ -534,6 +544,8 @@
+             macro = 'lasso_list_add_string'
+         elif is_xml_node(type):
+             macro = 'lasso_list_add_new_xml_node'
++        elif is_xml_doc(type):
++            macro = 'lasso_list_add_new_xml_doc'
+         elif is_object(type):
+             macro = 'lasso_list_add_gobject'
+         else:
+@@ -550,12 +562,14 @@
+             macro = 'lasso_assign_string'
+         elif is_xml_node(arg):
+             macro = 'lasso_assign_xml_node'
++        elif is_xml_doc(arg):
++            macro = 'lasso_assign_xml_doc'
+         elif is_glist(arg):
+             if not el_type:
+                 raise Exception('%s has no element type %s' % (arg, struct))
+             if is_cstring(el_type):
+                 macro = 'lasso_assign_list_of_strings'
+-            elif is_xml_node(el_type):
++            elif is_xml_node(el_type) or is_xml_doc(el_type):
+                 macro = 'lasso_assign_simple' # FIXME
+             elif is_object(el_type):
+                 macro = 'lasso_assign_list_of_gobjects'
+--- bindings/python/wrapper_top.c
++++ bindings/python/wrapper_top.c
+@@ -18,6 +18,8 @@
+ PyMODINIT_FUNC init_lasso(void);
+ G_GNUC_UNUSED static PyObject* get_pystring_from_xml_node(xmlNode *xmlnode);
+ G_GNUC_UNUSED static xmlNode*  get_xml_node_from_pystring(PyObject *string);
++G_GNUC_UNUSED static PyObject* get_pystring_from_xml_doc(xmlDoc *xmldoc);
++G_GNUC_UNUSED static xmlDoc*  get_xml_doc_from_pystring(PyObject *string);
+ G_GNUC_UNUSED static PyObject* get_dict_from_hashtable_of_objects(GHashTable *value);
+ G_GNUC_UNUSED static PyObject* get_dict_from_hashtable_of_strings(GHashTable *value);
+ G_GNUC_UNUSED static PyObject* PyGObjectPtr_New(GObject *obj);
+@@ -130,6 +132,24 @@
+ 	return pystring;
+ }
+ 
++static PyObject*
++get_pystring_from_xml_doc(xmlDoc *xmldoc)
++{
++	PyObject *pystring = NULL;
++	xmlChar *xmlString;
++        int size;
++
++	if (xmldoc == NULL) {
++		return NULL;
++	}
++
++        xmlDocDumpMemory(xmldoc, &xmlString, &size);
++        pystring = PyString_FromStringAndSize((char*)xmlString, size);
++        xmlFree(xmlString);
++
++	return pystring;
++}
++
+ static gboolean
+ valid_seq(PyObject *seq) {
+ 	if (! seq || ( seq != Py_None && ! PyTuple_Check(seq))) {
+@@ -328,6 +348,12 @@
+ 			PyString_Size(string));
+ }
+ 
++static xmlDoc*
++get_xml_doc_from_pystring(PyObject *string) {
++	return lasso_string_fragment_to_xmldoc(PyString_AsString(string),
++			PyString_Size(string));
++}
++
+ /** Return a tuple containing the string contained in a_list */
+ static PyObject *
+ get_list_of_strings(const GList *a_list) {
+--- bindings/python/lang.py
++++ bindings/python/lang.py
+@@ -78,6 +78,8 @@
+             pass
+         elif is_xml_node(type):
+             print >>fd, '   lasso_release_xml_node(%s);' % name
++        elif is_xml_doc(type):
++            print >>fd, '   lasso_release_xml_doc(%s);' % name
+         elif is_glist(type):
+             etype = element_type(type)
+             if is_cstring(etype):
+@@ -375,7 +377,7 @@
+             print >> fd, '    def get_%s(self):' % mname
+             print >> fd, '        t = _lasso.%s_%s_get(self._cptr)' % (
+                     klassname, mname)
+-            if is_int(m, self.binding_data) or is_xml_node(m) or is_cstring(m) or is_boolean(m):
++            if is_int(m, self.binding_data) or is_xml_node(m) or is_xml_doc(m) or is_cstring(m) or is_boolean(m):
+                 pass
+             elif is_object(m):
+                 print >> fd, '        t = cptrToPy(t)'
+@@ -383,7 +385,7 @@
+                 el_type = element_type(m)
+                 if is_cstring(el_type):
+                     pass
+-                elif is_xml_node(el_type):
++                elif is_xml_node(el_type) or is_xml_doc(el_type):
+                     pass
+                 elif is_object(el_type):
+                     print >> fd, '        if not t: return t'
+@@ -400,21 +402,21 @@
+                     print >> fd, '        t = frozendict(d2)'
+                 else:
+                     print >> fd, '        t = frozendict(t)'
+-            elif is_boolean(m) or is_int(m, self.binding_data) or is_xml_node(m) or is_cstring(m):
++            elif is_boolean(m) or is_int(m, self.binding_data) or is_xml_node(m) or is_xml_doc(m) or is_cstring(m):
+                 pass
+             else:
+                 raise Exception('Unsupported python getter %s.%s' % (clss, m))
+             print >> fd, '        return t;'
+             # setter
+             print >> fd, '    def set_%s(self, value):' % mname
+-            if is_int(m, self.binding_data) or is_xml_node(m) or is_cstring(m) or is_boolean(m):
++            if is_int(m, self.binding_data) or is_xml_node(m) or is_xml_doc(m) or is_cstring(m) or is_boolean(m):
+                 pass
+             elif is_object(m):
+                 print >> fd, '        if value is not None:'
+                 print >> fd, '            value = value and value._cptr'
+             elif is_glist(m):
+                 el_type = element_type(m)
+-                if is_cstring(el_type) or is_xml_node(el_type):
++                if is_cstring(el_type) or is_xml_node(el_type) or is_xml_doc(el_type):
+                     pass
+                 elif is_object(el_type):
+                     print >> fd, '        if value is not None:'
+@@ -463,7 +465,7 @@
+ 
+                 if is_out(arg):
+                     c_args.append(outvar)
+-                elif is_xml_node(arg) or is_boolean(arg) or is_cstring(arg) or is_int(arg, self.binding_data) or is_glist(arg) or is_hashtable(arg) or is_time_t_pointer(arg):
++                elif is_xml_node(arg) or is_xml_doc(arg) or is_boolean(arg) or is_cstring(arg) or is_int(arg, self.binding_data) or is_glist(arg) or is_hashtable(arg) or is_time_t_pointer(arg):
+                     c_args.append(arg_name(arg))
+                 elif is_object(arg):
+                     c_args.append('%(name)s and %(name)s._cptr' % { 'name': arg_name(arg) })
+@@ -506,7 +508,7 @@
+                 print >> fd, '        rc = _lasso.%s(self._cptr%s)' % (
+                         function_name, c_args)
+                 print >> fd, '        Error.raise_on_rc(rc)'
+-            elif is_int(m.return_arg, self.binding_data) or is_xml_node(m.return_arg) or is_cstring(m.return_arg) or is_boolean(m.return_arg):
++            elif is_int(m.return_arg, self.binding_data) or is_xml_node(m.return_arg) or is_xml_doc(m.return_arg) or is_cstring(m.return_arg) or is_boolean(m.return_arg):
+                 print >> fd, '        return _lasso.%s(self._cptr%s)' % (
+                         function_name, c_args)
+             elif is_glist(m.return_arg):
+@@ -758,7 +760,7 @@
+                 parse_format = 'i'
+                 parse_arg = '&value'
+                 print >> fd, '    %s value;' % type
+-            elif is_glist(m) or is_hashtable(m) or is_xml_node(m) or is_boolean(m):
++            elif is_glist(m) or is_hashtable(m) or is_xml_node(m) or is_xml_doc(m) or is_boolean(m):
+                 parse_format = 'O'
+                 print >> fd, '    PyObject *cvt_value;'
+                 parse_arg = '&cvt_value'
+@@ -782,12 +784,17 @@
+             elif is_xml_node(m):
+                 print >> fd, '    if (this->%s) xmlFreeNode(this->%s);' % (name, name)
+                 print >> fd, '    this->%s = get_xml_node_from_pystring(cvt_value);' % name
++            elif is_xml_doc(m):
++                print >> fd, '    if (this->%s) xmlFreeDoc(this->%s);' % (name, name)
++                print >> fd, '    this->%s = get_xml_doc_from_pystring(cvt_value);' % name
+             elif is_glist(m):
+                 el_type = element_type(m)
+                 if is_cstring(el_type):
+                     print >> fd, '    set_list_of_strings(&this->%s, cvt_value);' % name
+                 elif is_xml_node(el_type):
+                     print >> fd, '    set_list_of_xml_nodes(&this->%s, cvt_value);' % name
++                elif is_xml_doc(el_type):
++                    print >> fd, '    set_list_of_xml_docs(&this->%s, cvt_value);' % name
+                 elif is_object(el_type):
+                     print >> fd, '    set_list_of_pygobject(&this->%s, cvt_value);' % name
+                 else:
+@@ -838,6 +845,8 @@
+                 print >> fd, '    %s = get_list_of_strings(%s);' % (return_pyvar_name, return_var_name)
+             elif is_xml_node(el_type):
+                 print >> fd, '    %s = get_list_of_xml_nodes(%s);' % (return_pyvar_name, return_var_name)
++            elif is_xml_doc(el_type):
++                print >> fd, '    %s = get_list_of_xml_docs(%s);' % (return_pyvar_name, return_var_name)
+             else:
+                 raise Exception('failed to make an assignment for %s' % (arg,))
+         elif is_hashtable(arg):
+@@ -853,6 +862,13 @@
+             print >> fd, '    } else {'
+             print >> fd, '        %s = noneRef();' % return_pyvar_name
+             print >> fd, '    }'
++        elif is_xml_doc(arg):
++            # convert xmlDoc* to strings
++            print >> fd, '    if (%s) {' % return_var_name
++            print >> fd, '        %s = get_pystring_from_xml_doc(%s);' % (return_pyvar_name, return_var_name)
++            print >> fd, '    } else {'
++            print >> fd, '        %s = noneRef();' % return_pyvar_name
++            print >> fd, '    }'
+         elif is_object(arg):
+             # return a PyGObjectPtr (wrapper around GObject)
+             print >> fd, '''\
+@@ -907,7 +923,7 @@
+                     arg_def = '    %s %s = %s;' % (arg[0], arg[1], defval)
+                 else:
+                     arg_def = '    %s %s;' % (arg[0], arg[1])
+-            elif is_xml_node(arg) or is_list(arg) or is_time_t_pointer(arg):
++            elif is_xml_node(arg) or is_xml_doc(arg) or is_list(arg) or is_time_t_pointer(arg):
+                 parse_tuple_format.append('O')
+                 parse_tuple_args.append('&cvt_%s' % aname)
+                 arg_def = '    %s %s = NULL;' % (arg[0], arg[1])
+@@ -950,12 +966,16 @@
+                     print >> fd, '    set_list_of_strings(&%s, cvt_%s);' % (arg[1], arg[1])
+                 elif qualifier == 'xmlNode*':
+                     print >> fd, '    set_list_of_xml_nodes(&%s, cvt_%s);' % (arg[1], arg[1])
++                elif qualifier == 'xmlDoc*':
++                    print >> fd, '    set_list_of_xml_docs(&%s, cvt_%s);' % (arg[1], arg[1])
+                 elif isinstance(qualifier, basestring) and qualifier.startswith('Lasso'):
+                     print >> fd, '    set_list_of_pygobject(&%s, cvt_%s);' % (arg[1], arg[1])
+                 else:
+                     print >> sys.stderr, 'E: unqualified GList argument in', name, qualifier, arg
+             elif is_xml_node(arg):
+                 print >> fd, '    %s = get_xml_node_from_pystring(cvt_%s);' % (arg[1], arg[1])
++            elif is_xml_doc(arg):
++                print >> fd, '    %s = get_xml_doc_from_pystring(cvt_%s);' % (arg[1], arg[1])
+             elif is_time_t_pointer(arg):
+                 print >> fd, '    %s = get_time_t(cvt_%s);' % (arg[1], arg[1])
+             elif f == 'O':
+--- bindings/java/lang.py
++++ bindings/java/lang.py
+@@ -69,7 +69,7 @@
+ def jni_glist_elem_type(type):
+     if is_cstring(type):
+         return 'jstring'
+-    elif is_xml_node(type):
++    elif is_xml_node(type) or is_xml_doc(type):
+         return 'jstring'
+     elif is_object(type):
+         return 'jobject'
+@@ -85,7 +85,7 @@
+ def JNI_elem_type(type):
+     if is_cstring(type):
+         return 'String'
+-    elif is_xml_node(type):
++    elif is_xml_node(type) or is_xml_doc(type):
+         return 'String'
+     elif is_object(type):
+         return convert_class_name(type)
+@@ -231,7 +231,7 @@
+             return 'String'
+         elif is_collection(vtype):
+             return 'Object[]'
+-        elif is_xml_node(vtype):
++        elif is_xml_node(vtype) or is_xml_doc(vtype):
+             return 'String'
+         elif is_object(vtype):
+             return convert_class_name(unpointerize(unconstify(vtype)))
+@@ -252,6 +252,8 @@
+             return 'Object[]'
+         elif vtype == 'xmlNode*':
+             return 'String'
++        elif vtype == 'xmlDoc*':
++            return 'String'
+         elif isinstance(vtype,basestring) and vtype.startswith('Lasso'):
+             if vtype.endswith('*'):
+                 vtype = vtype[:-1]
+@@ -300,7 +302,7 @@
+                 print >> fd, '   public static native void %s(GObject obj, %s[] value);' % (name,jtype)
+                 name = '%s_add' % prefix
+                 print >> fd, '   public static native void %s(GObject obj, %s value);' % (name,jtype)
+-                if not m[2].get('element-type') in ('xmlNode*',):
++                if not m[2].get('element-type') in ('xmlNode*', 'xmlDoc*'):
+                     name = '%s_remove' % prefix
+                     print >> fd, '   public static native void %s(GObject obj, %s value);' % (name,jtype)
+             elif mtype == 'GHashTable*':
+@@ -388,7 +390,7 @@
+             return 'jstring'
+         elif is_glist(type) or is_hashtable(type):
+             return 'jobjectArray'
+-        elif is_xml_node(type):
++        elif is_xml_node(type) or is_xml_doc(type):
+             return 'jstring'
+         elif is_object(type):
+             return 'jobject'
+@@ -408,6 +410,8 @@
+                 return 'get_list_of_strings(env, %s, &%s)' % (right, left)
+             elif is_xml_node(el_type):
+                 return 'get_list_of_xml_nodes(env, %s, &%s)' % (right, left)
++            elif is_xml_doc(el_type):
++                return 'get_list_of_xml_docs(env, %s, &%s)' % (right, left)
+             elif is_object(el_type):
+                 return 'get_list_of_objects(env, %s, &%s)' % (right, left)
+             else:
+@@ -420,6 +424,8 @@
+                 return 'get_hash_of_strings(env, %s, &%s)' % (right, left)
+         elif is_xml_node(type):
+                 return 'xml_node_to_jstring(env, %s, &%s)' % (right, left)
++        elif is_xml_doc(type):
++                return 'xml_doc_to_jstring(env, %s, &%s)' % (right, left)
+         elif is_object(type):
+             if is_transfer_full(type):
+                 return 'gobject_to_jobject(env, (GObject*)%s, &%s);' % (right, left)
+@@ -439,6 +445,8 @@
+                 return 'set_list_of_strings(env, &%s,%s);' % (left,right)
+             elif is_xml_node(el_type):
+                 return 'set_list_of_xml_nodes(env, &%s, %s);' % (left, right)
++            elif is_xml_doc(el_type):
++                return 'set_list_of_xml_docs(env, &%s, %s);' % (left, right)
+             elif is_object(el_type):
+                 return 'set_list_of_objects(env, &%s, %s);' % (left, right)
+             else:
+@@ -451,6 +459,8 @@
+                 return 'set_hash_of_strings(env, %s, %s);' % (left,right)
+         elif is_xml_node(type):
+             return 'jstring_to_xml_node(env, %s, &%s);' % (right, left)
++        elif is_xml_doc(type):
++            return 'jstring_to_xml_doc(env, %s, &%s);' % (right, left)
+         elif is_object(type):
+             if is_transfer_full(type) or full:
+                 return 'jobject_to_gobject(env, %s, (GObject**)&%s);' % (right, left)
+@@ -640,6 +650,8 @@
+             print >> fd, '    add_to_list_of_strings(env, &%(field)s, value);' % d
+         elif is_xml_node(el_type):
+             print >> fd, '    add_to_list_of_xml_nodes(env, &%(field)s, value);' % d
++        elif is_xml_doc(el_type):
++            print >> fd, '    add_to_list_of_xml_docs(env, &%(field)s, value);' % d
+         elif is_object(el_type):
+             print >> fd, '    add_to_list_of_objects(env, &%(field)s, value);' % d
+         else:
+@@ -661,6 +673,9 @@
+         if is_xml_node(el_type):
+             print >>sys.stderr, 'W: remove for list of xml node not supported: %s' % (m,)
+             return
++        if is_xml_doc(el_type):
++            print >>sys.stderr, 'W: remove for list of xml doc not supported: %s' % (m,)
++            return
+         print >> fd,'/* Remover for %(type)s<%(el_type)s> %(klass)s.%(name)s */' % d
+         print >> fd, '%(signature)s, jobject jobj, %(jni_el_type)s value)\n  {' % d
+         print >> fd, '    %(klass)s *gobj = NULL;' % d
+@@ -824,7 +839,7 @@
+                     print >> fd, '    public void addTo%s(%s value) {' % (jname,jtype)
+                     print >> fd, '        LassoJNI.%s_add(this, value);' % prefix
+                     print >> fd, '    }'
+-                    if m[2].get('element-type') not in ('xmlNode*',):
++                    if m[2].get('element-type') not in ('xmlNode*', 'xmlDoc*'):
+                         print >> fd, '    public void removeFrom%s(%s value) {' % (jname,jtype)
+                         print >> fd, '        LassoJNI.%s_remove(this, value);' % prefix
+                         print >> fd, '    }'
+@@ -838,7 +853,7 @@
+                         print >> fd, '    public void addTo%s(%s value) {' % (old_jname,jtype)
+                         print >> fd, '        this.addTo%s(value);' % jname
+                         print >> fd, '    }'
+-                        if m[2].get('element-type') not in ('xmlNode*',):
++                        if m[2].get('element-type') not in ('xmlNode*', 'xmlDoc*'):
+                             print >> fd, '    public void removeFrom%s(%s value) {' % (old_jname,jtype)
+                             print >> fd, '        this.removeFrom%s(value);' % jname
+                             print >> fd, '    }'
+--- bindings/php5/wrapper_source.py
++++ bindings/php5/wrapper_source.py
+@@ -33,7 +33,7 @@
+ 
+     def is_object(self, t):
+         return t not in ['char*', 'const char*', 'gchar*', 'const gchar*', 'GList*', 'GHashTable*', 'GType',
+-                'xmlNode*', 'int', 'gint', 'gboolean', 'const gboolean'] + self.binding_data.enums
++                'xmlNode*', 'xmlDoc*', 'int', 'gint', 'gboolean', 'const gboolean'] + self.binding_data.enums
+ 
+     def generate(self):
+         self.generate_header()
+@@ -131,6 +131,17 @@
+         }
+     }
+ ''' % q
++        elif arg_type(type) == 'xmlDoc*':
++            print >> self.fd, '''\
++    {
++        char* xmlString = get_string_from_xml_doc(%(c_variable)s);
++        if (xmlString) {
++            ZVAL_STRING(%(zval_name)s, xmlString, 0);
++        } else {
++            ZVAL_NULL(%(zval_name)s);
++        }
++    }
++''' % q
+         elif is_glist(type):
+             elem_type = make_arg(element_type(type))
+             if not arg_type(elem_type):
+@@ -141,6 +152,9 @@
+             elif arg_type(elem_type).startswith('xmlNode'):
+                 function = 'set_array_from_list_of_xmlnodes'
+                 free_function = 'free_glist(&%(c_variable)s, (GFunc)xmlFree);'
++            elif arg_type(elem_type).startswith('xmlDoc'):
++                function = 'set_array_from_list_of_xmldocs'
++                free_function = 'free_glist(&%(c_variable)s, (GFunc)xmlFree);'
+             elif is_object(elem_type):
+                 function = 'set_array_from_list_of_objects'
+                 free_function = 'g_list_free(%(c_variable)s);'
+@@ -198,6 +212,17 @@
+         }
+     }
+ '''
++        elif is_xml_doc(arg):
++            print >> self.fd, '''\
++    {
++        char* xmlString = get_string_from_xml_doc(return_c_value);
++        if (xmlString) {
++            RETVAL_STRING(xmlString, 0);
++        } else {
++            RETVAL_NULL();
++        }
++    }
++'''
+         elif is_glist(arg):
+             el_type = element_type(arg)
+             if is_cstring(el_type):
+@@ -212,6 +237,12 @@
+ '''
+                 if free or is_transfer_full(arg):
+                     print >> self.fd, '    lasso_release_list_of_xml_node(return_c_value);'
++            elif is_xml_doc(el_type):
++                print >> self.fd, '''\
++    set_array_from_list_of_xmldocs((GList*)return_c_value, &return_value);
++'''
++                if free or is_transfer_full(arg):
++                    print >> self.fd, '    lasso_release_list_of_xml_node(return_c_value);'
+             elif is_object(el_type):
+                 print >> self.fd, '''\
+     set_array_from_list_of_objects((GList*)return_c_value, &return_value);
+@@ -284,6 +315,12 @@
+                 print >> self.fd, '    %s %s = NULL;' % ('xmlNode*', arg_name(arg))
+                 print >> self.fd, '    %s %s_str = NULL;'  % ('char*', arg_name(arg))
+                 print >> self.fd, '    %s %s_len = 0;' % ('int', arg_name(arg))
++            elif is_xml_doc(arg):
++                parse_tuple_format.append('s!')
++                parse_tuple_args.append('&%s_str, &%s_len' % (arg_name(arg), arg_name(arg)))
++                print >> self.fd, '    %s %s = NULL;' % ('xmlDoc*', arg_name(arg))
++                print >> self.fd, '    %s %s_str = NULL;'  % ('char*', arg_name(arg))
++                print >> self.fd, '    %s %s_len = 0;' % ('int', arg_name(arg))
+             elif is_glist(arg):
+                 parse_tuple_format.append('a!')
+                 parse_tuple_args.append('&zval_%s' % arg_name(arg))
+@@ -320,6 +357,9 @@
+             elif is_xml_node(arg):
+                 print >> self.fd, '''\
+         %(name)s = get_xml_node_from_string(%(name)s_str);''' % {'name': arg[1]}
++            elif is_xml_doc(arg):
++                print >> self.fd, '''\
++        %(name)s = get_xml_doc_from_string(%(name)s_str);''' % {'name': arg[1]}
+             elif f.startswith('s'):
+                 print >> self.fd, '''\
+         %(name)s = %(name)s_str;''' % {'name': arg[1]}
+@@ -363,6 +403,8 @@
+                 pass
+             elif argtype == 'xmlNode*':
+                 print >> self.fd, '    xmlFree(%s);' % argname
++            elif argtype == 'xmlDoc*':
++                print >> self.fd, '    xmlFree(%s);' % argname
+             elif f.startswith('a'):
+                 el_type = element_type(arg)
+                 if is_cstring(el_type):
+@@ -478,12 +520,16 @@
+             print >> self.fd, '    lasso_assign_string(this->%(name)s, %(name)s_str);' % d
+         elif is_xml_node(m):
+             print >> self.fd, '    lasso_assign_new_xml_node(this->%(name)s, get_xml_node_from_string(%(name)s_str));' % d
++        elif is_xml_doc(m):
++            print >> self.fd, '    lasso_assign_new_xml_doc(this->%(name)s, get_xml_doc_from_string(%(name)s_str));' % d
+         elif is_glist(m):
+             el_type = element_type(m)
+             if is_cstring(el_type):
+                 print >> self.fd, '    lasso_assign_new_list_of_strings(this->%(name)s, get_list_from_array_of_strings(zval_%(name)s));' % d
+             elif is_xml_node(el_type):
+                 print >> self.fd, '    lasso_assign_new_list_of_xml_node(this->%(name)s, get_list_from_array_of_xmlnodes(zval_%(name)s))' % d
++            elif is_xml_doc(el_type):
++                print >> self.fd, '    lasso_assign_new_list_of_xml_doc(this->%(name)s, get_list_from_array_of_xmldocs(zval_%(name)s))' % d
+             elif is_object(el_type):
+                 print >> self.fd, '    lasso_assign_new_list_of_gobjects(this->%(name)s, get_list_from_array_of_objects(zval_%(name)s));' % d
+             else:
+@@ -508,7 +554,7 @@
+ 
+     def generate_functions_list(self):
+         print >> self.fd, '''\
+-static function_entry lasso_functions[] = {'''
++static zend_function_entry lasso_functions[] = {'''
+         for m in self.functions_list:
+             print >> self.fd, '    PHP_FE(%s, NULL)' % m
+         print >> self.fd, '''\
+--- bindings/php5/wrapper_source_top.c
++++ bindings/php5/wrapper_source_top.c
+@@ -146,12 +146,33 @@
+ 	return xmlString;
+ }
+ 
++static char*
++get_string_from_xml_doc(xmlDoc *xmldoc)
++{
++	xmlChar *xmlString;
++        int size;
++
++	if (xmldoc == NULL) {
++		return NULL;
++	}
++
++        xmlDocDumpMemory(xmldoc, &xmlString, &size);
++
++        return (char *) xmlString;
++}
++
+ static xmlNode*
+ get_xml_node_from_string(char *string)
+ {
+ 	return lasso_string_fragment_to_xmlnode(string, 0);
+ }
+ 
++static xmlDoc*
++get_xml_doc_from_string(char *string)
++{
++	return lasso_string_fragment_to_xmldoc(string, 0);
++}
++
+ static GList*
+ get_list_from_array_of_strings(zval* array)
+ {
