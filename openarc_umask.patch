@@ -1,0 +1,67 @@
+diff --git a/openarc/openarc-config.h b/openarc/openarc-config.h
+index dfbd661..26d30c1 100644
+--- a/openarc/openarc-config.h
++++ b/openarc/openarc-config.h
+@@ -52,6 +52,7 @@ struct configdef arcf_config[] =
+ 	{ "Syslog",			CONFIG_TYPE_BOOLEAN,	FALSE },
+ 	{ "SyslogFacility",		CONFIG_TYPE_STRING,	FALSE },
+ 	{ "TemporaryDirectory",		CONFIG_TYPE_STRING,	FALSE },
++	{ "UMask",			CONFIG_TYPE_INTEGER,	FALSE },
+ 	{ "UserID",			CONFIG_TYPE_STRING,	FALSE },
+ 	{ NULL,				(u_int) -1,		FALSE }
+ };
+diff --git a/openarc/openarc.c b/openarc/openarc.c
+index 7e191dc..1e942e7 100644
+--- a/openarc/openarc.c
++++ b/openarc/openarc.c
+@@ -4413,6 +4413,8 @@ main(int argc, char **argv)
+ 			                  sizeof pidfile);
+ 		}
+ 
++		(void) config_get(cfg, "UMask", &filemask, sizeof filemask);
++
+ 		if (become == NULL)
+ 		{
+ 			(void) config_get(cfg, "Userid", &become,
+diff --git a/openarc/openarc.conf.5.in b/openarc/openarc.conf.5.in
+index dea28c4..e19953d 100644
+--- a/openarc/openarc.conf.5.in
++++ b/openarc/openarc.conf.5.in
+@@ -240,6 +240,17 @@ allowed in
+ .I syslog.conf(5).
+ The default is "mail".
+ 
++.TP
++.I UMask (integer)
++Requests a specific permissions mask to be used for file creation.
++This only applies to creation of the socket when
++.I Socket
++specifies a UNIX domain socket, and to the
++.I PidFile
++(if any).  See
++.I umask(2)
++for more information.
++
+ .TP
+ .I UserID (string)
+ Attempts to become the specified userid before starting operations.
+diff --git a/openarc/openarc.conf.sample b/openarc/openarc.conf.sample
+index 8a9f320..83ed8bb 100644
+--- a/openarc/openarc.conf.sample
++++ b/openarc/openarc.conf.sample
+@@ -271,6 +271,15 @@ Syslog			Yes
+ 
+ # TemporaryDirectory	/tmp
+ 
++##  UMask mask
++##  	default (none)
++##
++##  Change the process umask for file creation to the specified value.
++##  The system has its own default which will be used (usually 022).
++##  See the umask(2) man page for more information.
++
++# UMask			022
++
+ ##  Userid userid
+ ##  	default (none)
+ ##
